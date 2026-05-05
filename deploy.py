@@ -269,9 +269,9 @@ def check_azure_resources(rg, db_fqdn):
 # ── step 7 — wait for api ─────────────────────────────────────────────────────
 
 def wait_for_api(vm_ip):
-    info("Waiting for API (cloud-init takes ~2 min)")
+    info("Waiting for API (cloud-init takes ~20 min)")
     api = f"http://{vm_ip}:8000"
-    for _ in range(36):
+    for _ in range(300):
         try:
             urllib.request.urlopen(f"{api}/docs", timeout=3)
             print()
@@ -281,7 +281,7 @@ def wait_for_api(vm_ip):
             print(".", end="", flush=True)
             time.sleep(5)
     print()
-    fail("API did not respond after 3 min — SSH in and run: sudo journalctl -u learningsteps -f")
+    fail("API did not respond after 25 min — SSH in and run: sudo journalctl -u learningsteps -f")
     return None
 
 # ── step 8 — api tests ────────────────────────────────────────────────────────
