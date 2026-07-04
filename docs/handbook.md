@@ -85,6 +85,19 @@ to the application layer instead of SSH.
 2. Create a Proxy Host for the app: domain = your VM's FQDN, forward to
    `127.0.0.1:8000`. Leave TLS off for now — that's Day 4.
 
+   Via API instead of the GUI:
+   ```bash
+   curl -sk -c npm.cookies -X POST https://localhost:8081/api/tokens \
+     -H "Content-Type: application/json" \
+     -d '{"identity":"admin@learningsteps.local","secret":"LearningSteps123!"}'
+
+   curl -sk -X POST https://localhost:8081/api/nginx/proxy-hosts \
+     -b npm.cookies -H "Content-Type: application/json" \
+     -d '{"domain_names":["<domain>"],"forward_scheme":"http","forward_host":"127.0.0.1","forward_port":8000,"locations":[]}'
+   ```
+   The `"locations": []` field must be included explicitly — omitting it
+   breaks the Auth Request step later on.
+
 3. Register an Entra ID application for the API:
    ```
    APP_ID=$(az ad app create --display-name learningsteps-oauth2-proxy \
@@ -100,6 +113,7 @@ to the application layer instead of SSH.
    OAUTH2_PROXY_CLIENT_ID=$APP_ID
    OAUTH2_PROXY_CLIENT_SECRET=$SECRET
    OAUTH2_PROXY_OIDC_ISSUER_URL=https://login.microsoftonline.com/$TENANT_ID/v2.0
+   OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=api://$APP_ID
    ```
    Set `--redirect-url=https://<domain>/oauth2/callback` in
    `/etc/systemd/system/oauth2-proxy.service`, then:
@@ -114,6 +128,16 @@ to the application layer instead of SSH.
    config — worth opening the generated nginx config on the VM afterward to
    see what the dropdown just built for you.
 
+   Via API instead:
+   ```bash
+   curl -sk -X PUT https://localhost:8081/api/nginx/proxy-hosts/<id> \
+     -b npm.cookies -H "Content-Type: application/json" \
+     -d '{"advanced_config":"","locations":[],"access_list_id":0}'
+   # Then set AUTH_REQUEST_OAUTH2PROXY_UPSTREAM=http://127.0.0.1:4180 as an
+   # env var on the NPMplus container and select the provider on the host
+   # via the API's auth-request field per /api/schema for your NPMplus version.
+   ```
+
 6. Test:
    - `curl -i http://<domain>/` → redirected to Microsoft sign-in
      (unauthenticated).
@@ -121,6 +145,16 @@ to the application layer instead of SSH.
      also redirected (a malformed token doesn't get a free pass).
    - Visit `https://<domain>/` in a browser, complete the Microsoft login,
      land on the app with a valid session.
+   - To verify the full identity check without a browser (useful for
+     scripting/grading), get a real Entra ID token scoped to the app and
+     send it directly:
+     ```bash
+     TOKEN=$(az account get-access-token --tenant $TENANT_ID \
+       --resource api://$APP_ID --query accessToken -o tsv)
+     curl -i http://<domain>/entries -H "Authorization: Bearer $TOKEN"
+     ```
+     This should return `200` with no browser redirect — oauth2-proxy
+     validates the bearer token directly against Entra ID's signing keys.
 
 ### Troubleshooting
 
@@ -203,6 +237,18 @@ curl -i https://<domain>/entries
 returns a valid, browser-trusted certificate, and that plain HTTP now
 redirects to HTTPS.
 
+Via API instead:
+```bash
+CERT_ID=$(curl -sk -X POST https://localhost:8081/api/nginx/certificates \
+  -b npm.cookies -H "Content-Type: application/json" \
+  -d '{"provider":"letsencrypt","domain_names":["<domain>"],"meta":{"dns_challenge":false}}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+curl -sk -X PUT https://localhost:8081/api/nginx/proxy-hosts/<id> \
+  -b npm.cookies -H "Content-Type: application/json" \
+  -d "{\"certificate_id\":$CERT_ID,\"ssl_forced\":true}"
+```
+
 **Step 3 — web application firewall.** First show the gap: send known attack
 payloads and note they pass straight through:
 ```
@@ -230,11 +276,16 @@ docker exec crowdsec cscli alerts list
 **Important — test this authenticated.** Since Day 2's identity check runs
 before the WAF check on the same path, an unauthenticated attack request
 gets redirected to the login page rather than reaching the WAF at all — so
-it won't show a `403`. To see the WAF in action, log in through the browser
-first (or attach a valid session cookie to your `curl` calls) and send the
-payloads with that session. This is a good discussion point: the WAF is
-still protecting you, just against attackers who already have (or stole) a
-valid session — arguably the more realistic threat.
+it won't show a `403`. To see the WAF in action, attach a valid identity to
+the request first — either a browser session cookie, or the same bearer
+token approach from Day 2:
+```bash
+curl -i "https://<domain>/entries?id=1+UNION+SELECT+*+FROM+users" \
+  -H "Authorization: Bearer $TOKEN"
+```
+This is a good discussion point: the WAF is still protecting you, just
+against attackers who already have (or stole) a valid session — arguably
+the more realistic threat.
 
 **A note worth mentioning out loud**: CrowdSec shares detected attack
 signals with its community threat-intel blocklist by default. Check
@@ -289,7 +340,8 @@ attacker at the network level.
    ```
    for i in $(seq 1 6); do
      curl -s -o /dev/null -w "%{http_code}\n" \
-       "https://<domain>/entries?id=1+UNION+SELECT+*+FROM+users"
+       "https://<domain>/entries?id=1+UNION+SELECT+*+FROM+users" \
+       -H "Authorization: Bearer $TOKEN"
    done
    ```
    All six should return `403` (the WAF must already be enabled from Day 4).

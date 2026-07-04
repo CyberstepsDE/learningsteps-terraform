@@ -42,6 +42,12 @@ OAUTH2_PROXY_CLIENT_ID=
 OAUTH2_PROXY_CLIENT_SECRET=
 OAUTH2_PROXY_OIDC_ISSUER_URL=https://login.microsoftonline.com/TENANT_ID/v2.0
 OAUTH2_PROXY_COOKIE_SECRET=
+# api://$APP_ID — same value as the app registration's identifier URI. Lets
+# oauth2-proxy validate a bearer token (az account get-access-token
+# --resource api://$APP_ID) directly, without a browser session — used to
+# verify the auth flow end-to-end (see docs/handbook.md Day 2, step 6).
+OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=
+OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS=true
 EOF
 fi
 
