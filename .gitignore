@@ -13,3 +13,4 @@ SECURITY_ROADMAP.md
 terraform.tfstate.*.backup
 .DS_Store
 *.sql
+.playwright-mcp/

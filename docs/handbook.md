@@ -52,8 +52,11 @@ IP entirely.
 Open `network.tf` and restrict the `allow-ssh` rule's
 `source_address_prefix` from `"*"` to your own IP:
 ```
-curl -s ifconfig.me
+curl -s -4 ifconfig.me
 ```
+The `-4` matters: on a dual-stack machine, plain `ifconfig.me` can return
+your IPv6 address, but the VM's public IP is IPv4-only — an IPv6 source
+prefix silently locks you out of SSH once applied.
 Update the rule, then `terraform apply` (**wait time: under a minute**). The
 change takes effect immediately — a connection from any other IP will now
 be refused.
@@ -140,18 +143,45 @@ token outright. This is unrelated to `OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES` or
 `SKIP_JWT_BEARER_TOKENS` — both can be configured correctly and the
 bearer-token test in Demo 6 will still fail without this token-version fix.
 
+Also required — expose an API scope, and register the reply URL that
+oauth2-proxy will redirect to after login:
+```
+SCOPE_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
+az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$OBJECT_ID" \
+  --body "{\"api\":{\"oauth2PermissionScopes\":[{\"id\":\"$SCOPE_ID\",\"adminConsentDescription\":\"Access as user\",\"adminConsentDisplayName\":\"access_as_user\",\"isEnabled\":true,\"type\":\"User\",\"userConsentDescription\":\"Access as user\",\"userConsentDisplayName\":\"access_as_user\",\"value\":\"access_as_user\"}]}}"
+
+az ad app update --id $APP_ID --web-redirect-uris "https://<domain>/oauth2/callback"
+```
+Without an exposed scope, the first `az account get-access-token
+--resource api://$APP_ID` in Demo 6 fails outright with `AADSTS650057:
+Invalid resource` — `az ad app create` does not add one by default.
+Without the reply URL registered, the real browser login in Demo 6 fails
+with `AADSTS500113: No reply address is registered for the application`.
+Note Entra rejects non-HTTPS reply URLs (except `localhost`) — so the
+*reply URL itself* must be `https://`, which means the full interactive
+browser login in Demo 6 cannot actually complete until Day 4's TLS step is
+live. Register it here anyway (so it's ready), verify Demo 6 with the
+bearer-token method for now, and come back to confirm the real browser
+round-trip once Day 4 is done.
+
 **Wait time**: allow a minute after `az ad sp create` before testing tokens
 — Entra ID directory replication can lag briefly for a brand-new Service
 Principal.
 
 ### Demo 4 — Configure and Start oauth2-proxy
 
-On the VM, fill in `/etc/oauth2-proxy/oauth2-proxy.env`:
+On the VM, fill in the empty fields in `/etc/oauth2-proxy/oauth2-proxy.env`
+with `sed` — don't overwrite the whole file. `setup-oauth2-proxy.sh`
+already pre-populated `OAUTH2_PROXY_COOKIE_SECRET` and
+`OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS`; replacing the file wholesale wipes
+them and oauth2-proxy refuses to start (`missing setting: cookie-secret`):
 ```
-OAUTH2_PROXY_CLIENT_ID=$APP_ID
-OAUTH2_PROXY_CLIENT_SECRET=$SECRET
-OAUTH2_PROXY_OIDC_ISSUER_URL=https://login.microsoftonline.com/$TENANT_ID/v2.0
-OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=api://$APP_ID
+sudo sed -i \
+  -e "s#^OAUTH2_PROXY_CLIENT_ID=.*#OAUTH2_PROXY_CLIENT_ID=$APP_ID#" \
+  -e "s#^OAUTH2_PROXY_CLIENT_SECRET=.*#OAUTH2_PROXY_CLIENT_SECRET=$SECRET#" \
+  -e "s#^OAUTH2_PROXY_OIDC_ISSUER_URL=.*#OAUTH2_PROXY_OIDC_ISSUER_URL=https://login.microsoftonline.com/$TENANT_ID/v2.0#" \
+  -e "s#^OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=.*#OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=api://$APP_ID#" \
+  /etc/oauth2-proxy/oauth2-proxy.env
 ```
 Set `--redirect-url=https://<domain>/oauth2/callback` in
 `/etc/systemd/system/oauth2-proxy.service`, then:
@@ -186,7 +216,11 @@ curl -sk -X PUT https://localhost:8081/api/nginx/proxy-hosts/<id> \
 - `curl -i -H "Authorization: Bearer garbage" http://<domain>/` → also
   redirected (a malformed token doesn't get a free pass).
 - Visit `https://<domain>/` in a browser, complete the Microsoft login, land
-  on the app with a valid session.
+  on the app with a valid session. **This step only works after Day 4's TLS
+  is live** (Entra rejects the `http://` reply URL outright — see the note
+  in Demo 3). Until then, use the bearer-token method below as your Day 2
+  verification, and circle back to confirm the real browser round-trip once
+  Day 4 is done.
 - To verify the full identity check without a browser (useful for
   scripting/grading), get a real Entra ID token scoped to the app and send
   it directly:
@@ -367,22 +401,23 @@ curl -i "https://<domain>/entries?id=1+UNION+SELECT+*+FROM+users"
 curl -i "https://<domain>/entries?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
 ```
 
-Enable the WAF (CrowdSec, running the OWASP Core Rule Set):
+Enable the WAF (CrowdSec, running the OWASP Core Rule Set). `azureuser`
+isn't in the `docker` group, so this needs `sudo`:
 ```
-docker exec crowdsec cscli bouncers add npmplus
+sudo docker exec crowdsec cscli bouncers add npmplus
 # copy the printed API key immediately — it's shown once
 sudo nano /opt/npmplus/crowdsec/crowdsec.conf
 #   ENABLED=true
 #   API_URL=http://127.0.0.1:8080
 #   APPSEC_URL=http://127.0.0.1:7422
 #   API_KEY=<paste key>
-cd /opt/npmplus && docker compose restart npmplus
+cd /opt/npmplus && sudo docker compose restart npmplus
 ```
 **Wait time: 1-2 minutes** for the container restart.
 
 Re-send the same payloads — both now return `403`. Inspect the block with:
 ```
-docker exec crowdsec cscli alerts list
+sudo docker exec crowdsec cscli alerts list
 ```
 
 **Important — test this authenticated.** Since Day 2's identity check runs
@@ -414,7 +449,7 @@ which way the class decides to leave it.
   re-enable.
 - **A previously-blocked IP still gets 403'd on a clean request**: after
   enough attack attempts, CrowdSec may issue a longer-lived ban for that IP
-  (`docker exec crowdsec cscli decisions list`), independent of any single
+  (`sudo docker exec crowdsec cscli decisions list`), independent of any single
   request's content. This is expected — the IP is banned outright, not
   still being flagged request-by-request.
 
@@ -505,6 +540,6 @@ check both.
   rule will fire on its next 5-minute cycle; if it returns nothing, the
   problem is upstream of Sentinel (check Demo 1's local log output first).
 - **A retest right after a successful block seems to fail strangely**: check
-  `docker exec crowdsec cscli decisions list` — the attacking IP may already
+  `sudo docker exec crowdsec cscli decisions list` — the attacking IP may already
   be under a longer CrowdSec ban independent of the NSG rule, which will
   make all its requests fail rather than just the malicious-looking ones.
