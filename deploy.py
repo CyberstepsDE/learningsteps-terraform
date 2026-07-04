@@ -528,6 +528,35 @@ echo "Results: $PASS passed, $FAIL_COUNT failed"
         elif line.startswith("Results:"):
             print(f"  {line}")
 
+# ── step 10 — seed sample data ────────────────────────────────────────────────
+
+def seed_sample_data(vm_ip, key_path, db_fqdn):
+    # Must run after run_api_tests(): its own smoke test calls DELETE /entries
+    # with no id, which the app treats as "clear the whole table" — seeding
+    # any earlier (e.g. from cloud-init, before the smoke test runs) gets
+    # silently wiped out before a student ever sees it.
+    info("Seeding sample journal entries")
+    tfvars = SCRIPT_DIR / "terraform.tfvars"
+    pw = None
+    for line in tfvars.read_text().splitlines():
+        if line.strip().startswith("db_admin_password"):
+            pw = line.split("=", 1)[1].strip().strip('"')
+    if not pw:
+        warn("could not read db_admin_password from terraform.tfvars — skipping seed")
+        return
+    db_url = f"postgresql://psqladmin:{pw}@{db_fqdn}/learning_journal?sslmode=require"
+    script = f"""
+psql "{db_url}" -c "INSERT INTO entries (id, data, created_at, updated_at) VALUES
+('seed-1', '{{\\"work\\": \\"Deployed the LearningSteps environment\\", \\"struggle\\": \\"None yet\\", \\"intention\\": \\"Complete this week''s security course\\"}}', now(), now()),
+('seed-2', '{{\\"work\\": \\"Reviewed the course handbook\\", \\"struggle\\": \\"Lots of new Azure concepts\\", \\"intention\\": \\"Ask questions during the demos\\"}}', now(), now())
+ON CONFLICT (id) DO NOTHING;"
+"""
+    rc, out, err = ssh_run_script(vm_ip, key_path, script, timeout=30)
+    if rc == 0:
+        ok("sample entries seeded")
+    else:
+        warn(f"could not seed sample entries: {err.strip()}")
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -551,6 +580,7 @@ def main():
     check_azure_resources(rg, db_fqdn)
     if wait_for_service(vm_ip, key_path):
         run_api_tests(vm_ip, key_path)
+        seed_sample_data(vm_ip, key_path, db_fqdn)
 
     if run_npmplus_setup(vm_ip, key_path):
         wait_for_npmplus(app_url)
