@@ -71,7 +71,18 @@ def run(cmd, cwd=SCRIPT_DIR, **kwargs):
         error(f"Command not found: {cmd[0]}")
         raise SystemExit(1) from exc
 
-def run_out(cmd, cwd=None):
+def run_out(cmd, cwd=None, exit_on_error=True):
+    """Run a command and return its stdout.
+
+    By default, a failure prints a clean error and hard-exits the whole
+    script (used for one-shot calls like reading terraform output, where a
+    failure is unrecoverable). Pass exit_on_error=False for calls a caller
+    intends to retry/handle itself (e.g. polling loops using az run-command,
+    which can transiently fail with Azure's "Conflict: Run command extension
+    execution is in progress" — only one run-command execution is allowed
+    per VM at a time) — in that case the original subprocess.CalledProcessError
+    is re-raised so the caller's own try/except can catch it.
+    """
     cmd = _resolve_cmd(cmd)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=cwd)
@@ -79,6 +90,8 @@ def run_out(cmd, cwd=None):
         error(f"Command not found: {cmd[0]}")
         raise SystemExit(1) from exc
     except subprocess.CalledProcessError as exc:
+        if not exit_on_error:
+            raise
         error(f"Command failed with exit code {exc.returncode}")
         if exc.stderr:
             print(f"  stderr: {exc.stderr}", file=sys.stderr)
@@ -90,6 +103,49 @@ def run_out(cmd, cwd=None):
 def tf(cmd):
     """Run a terraform command with output, always from SCRIPT_DIR."""
     return run_out(cmd, cwd=SCRIPT_DIR)
+
+# ── SSH helper ──────────────────────────────────────────────────────────────
+# `az vm run-command invoke` (the old approach) was found during testing to be
+# unreliable when polled repeatedly: Azure's non-managed "immediate" run-command
+# API can intermittently return a stale/default placeholder result ("This is a
+# sample script") instead of actually executing the submitted script, even with
+# no concurrent invocations in flight. Direct SSH with the key deploy.py already
+# generates is simpler and was confirmed reliable during this migration's
+# testing, so it's used for all VM-side polling and setup-script execution.
+
+SSH_OPTS = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+    "-o", "ConnectTimeout=10",
+]
+
+def ssh_run(vm_ip, key_path, remote_cmd, timeout=120):
+    """Run a command on the VM over SSH. Returns (returncode, stdout, stderr)."""
+    cmd = ["ssh", "-i", str(key_path), *SSH_OPTS, f"azureuser@{vm_ip}", remote_cmd]
+    cmd = _resolve_cmd(cmd)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "ssh timed out"
+    except FileNotFoundError as exc:
+        error(f"Command not found: {cmd[0]}")
+        raise SystemExit(1) from exc
+
+def ssh_run_script(vm_ip, key_path, script_text, timeout=600):
+    """Pipe a script's contents into `sudo bash` over SSH (stdin, no temp files
+    needed on either side). Returns (returncode, stdout, stderr)."""
+    cmd = ["ssh", "-i", str(key_path), *SSH_OPTS, f"azureuser@{vm_ip}", "sudo bash -s"]
+    cmd = _resolve_cmd(cmd)
+    try:
+        r = subprocess.run(cmd, input=script_text, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "ssh timed out"
+    except FileNotFoundError as exc:
+        error(f"Command not found: {cmd[0]}")
+        raise SystemExit(1) from exc
 
 def need(binary, install_hint):
     if not shutil.which(binary):
@@ -108,7 +164,7 @@ def check_prerequisites():
     ok("ssh-keygen found")
 
     try:
-        account = run_out(["az", "account", "show", "--query", "{name:name}", "-o", "json"])
+        account = run_out(["az", "account", "show", "--query", "{name:name}", "-o", "json"], exit_on_error=False)
         parsed = json.loads(account)
         ok(f"Logged in — subscription: {parsed['name']}")
     except subprocess.CalledProcessError:
@@ -118,7 +174,7 @@ def check_prerequisites():
         ok(f"Logged in — subscription: {json.loads(account)['name']}")
 
     try:
-        run_out(["az", "extension", "show", "--name", "ssh"])
+        run_out(["az", "extension", "show", "--name", "ssh"], exit_on_error=False)
         ok("az ssh extension present")
     except subprocess.CalledProcessError:
         warn("az ssh extension missing — installing")
@@ -253,7 +309,7 @@ def setup_aad_ssh(rg, vm_name):
     info("Azure AD SSH — role assignment")
 
     try:
-        user_id = run_out(["az", "ad", "signed-in-user", "show", "--query", "id", "-o", "tsv"])
+        user_id = run_out(["az", "ad", "signed-in-user", "show", "--query", "id", "-o", "tsv"], exit_on_error=False)
     except subprocess.CalledProcessError:
         warn("Could not retrieve signed-in user — skipping AAD SSH role assignment")
         return
@@ -315,7 +371,7 @@ def check_azure_resources(rg, db_fqdn):
     try:
         db_state = run_out(["az", "postgres", "flexible-server", "show",
                             "--resource-group", rg, "--name", db_server,
-                            "--query", "state", "-o", "tsv"])
+                            "--query", "state", "-o", "tsv"], exit_on_error=False)
     except subprocess.CalledProcessError as exc:
         stderr = getattr(exc, "stderr", "") or ""
         if "ServerStoppedError" in stderr or "Stopped" in stderr:
@@ -333,80 +389,95 @@ def check_azure_resources(rg, db_fqdn):
 
 # ── step 8 — wait for api ─────────────────────────────────────────────────────
 
-def wait_for_service(rg, vm_name):
-    info("Waiting for API service to start on VM (cloud-init takes ~20 min)")
-    for _ in range(100):
-        try:
-            result = run_out([
-                "az", "vm", "run-command", "invoke",
-                "--resource-group", rg, "--name", vm_name,
-                "--command-id", "RunShellScript",
-                "--scripts", "curl -sf localhost:8000/entries > /dev/null && echo READY || echo NOT_READY",
-                "--query", "value[0].message", "-o", "tsv"
-            ])
-            if "READY" in result:
-                print()
-                ok("API service is running on VM")
-                return True
-        except subprocess.CalledProcessError:
-            pass
+def wait_for_service(vm_ip, key_path):
+    info("Waiting for API service to start on VM over SSH (cloud-init takes ~10-15 min)")
+    for _ in range(80):
+        rc, out, _ = ssh_run(vm_ip, key_path,
+            "curl -sf localhost:8000/entries > /dev/null && echo READY || echo NOT_READY",
+            timeout=20)
+        if rc == 0 and "READY" in out:
+            print()
+            ok("API service is running on VM")
+            return True
         print(".", end="", flush=True)
         time.sleep(15)
     print()
-    fail("API service not ready after 25 min — SSH in and check: sudo journalctl -u learningsteps -f")
+    fail("API service not ready after ~20 min — SSH in and check: sudo journalctl -u learningsteps -f")
     return False
 
-def run_nginx_setup(rg, vm_name, domain, email):
-    info("Nginx + Let's Encrypt + NAXSI setup (runs on VM via az run-command)")
-    script_path = SCRIPT_DIR / "scripts" / "setup-nginx.sh"
-    script_content = script_path.read_text()
-    full_script = f"export DOMAIN='{domain}'\nexport EMAIL='{email}'\n" + script_content
-    try:
-        result = run_out([
-            "az", "vm", "run-command", "invoke",
-            "--resource-group", rg, "--name", vm_name,
-            "--command-id", "RunShellScript",
-            "--scripts", full_script,
-            "--query", "value[0].message", "-o", "tsv",
-        ])
-        for line in result.split("\n"):
-            line = line.strip()
-            if line:
-                print(f"  {line}")
-        ok("Nginx setup complete")
+def _run_setup_script(vm_ip, key_path, script_name, label):
+    """Run one of the scripts/*.sh setup scripts on the VM over SSH (piped to sudo bash -s)."""
+    script_path = SCRIPT_DIR / "scripts" / script_name
+    rc, out, err = ssh_run_script(vm_ip, key_path, script_path.read_text(), timeout=600)
+    for line in out.split("\n"):
+        line = line.strip()
+        if line:
+            print(f"  {line}")
+    if rc == 0:
+        ok(f"{label} complete")
         return True
-    except subprocess.CalledProcessError as e:
-        fail(f"Nginx setup failed: {e}")
-        warn("SSH in and run manually: sudo bash /tmp/setup-nginx.sh <domain> <email>")
-        return False
+    fail(f"{label} failed (exit {rc}): {err.strip()[-500:] if err else ''}")
+    warn(f"SSH in and run manually: sudo bash /tmp/{script_name} (scp it up first)")
+    return False
 
 
-def wait_for_nginx_tls(app_url):
-    info(f"Waiting for Nginx HTTPS to be ready")
-    url = f"{app_url}/entries"
+def run_npmplus_setup(vm_ip, key_path):
+    info("Docker + NPMplus + CrowdSec baseline (runs on VM over SSH, ~3-5 min: pulls 2 images)")
+    return _run_setup_script(vm_ip, key_path, "setup-npmplus.sh", "NPMplus/CrowdSec setup")
+
+
+def run_oauth2_proxy_setup(vm_ip, key_path):
+    info("oauth2-proxy binary + systemd unit (not started — OIDC creds are the Day 2 live demo)")
+    return _run_setup_script(vm_ip, key_path, "setup-oauth2-proxy.sh", "oauth2-proxy install")
+
+
+def run_json_logging_setup(vm_ip, key_path):
+    info("Day 5 — NPMplus access-log -> syslog local0 JSON forwarder")
+    return _run_setup_script(vm_ip, key_path, "setup-json-logging.sh", "Log forwarder setup")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """NPMplus's default host 301-redirects http -> https out of the box (before
+    any Proxy Host exists). Following that redirect hits NPMplus's self-signed
+    dummy cert and raises an unhandled SSL verification error — discovered
+    during this migration's testing, since it made this check silently spin
+    for the full timeout instead of recognizing NPMplus was already up.
+    Returning None here makes urllib raise HTTPError instead of following the
+    redirect, which the caller already treats as "server answered"."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+def wait_for_npmplus(app_url_base):
+    """NPMplus listens on :80/:443 immediately, but with no Proxy Host configured
+    yet (that's created live in the Day 4 demo) it serves its own default/dead
+    page rather than the app. This just confirms NPMplus itself answered."""
+    info("Waiting for NPMplus to accept connections on :80")
+    url = f"{app_url_base.replace('https://', 'http://')}"
     for _ in range(40):
         try:
-            resp = urllib.request.urlopen(urllib.request.Request(url), timeout=5)
+            _NO_REDIRECT_OPENER.open(urllib.request.Request(url), timeout=5)
             print()
-            ok(f"Nginx HTTPS reachable at {app_url} (HTTP {resp.status})")
+            ok(f"NPMplus is answering on {url}")
             return True
-        except urllib.error.HTTPError as e:
-            if e.code in (302, 401, 403, 404):
-                print()
-                ok(f"Nginx HTTPS reachable at {app_url} (HTTP {e.code})")
-                return True
+        except urllib.error.HTTPError:
+            # Any HTTP response (even a 301/404/444) means nginx inside NPMplus is up
+            print()
+            ok(f"NPMplus is answering on {url}")
+            return True
         except Exception:
             pass
         print(".", end="", flush=True)
         time.sleep(15)
     print()
-    warn("Nginx HTTPS did not respond — check: sudo journalctl -u nginx -f  or  sudo cat /var/log/letsencrypt/letsencrypt.log")
+    warn("NPMplus did not respond on :80 — check: docker ps / docker logs npmplus")
     return False
 
 # ── step 9 — api tests ────────────────────────────────────────────────────────
 
-def run_api_tests(rg, vm_name):
-    info("API tests (running inside VM via run-command)")
+def run_api_tests(vm_ip, key_path):
+    info("API tests (running inside VM over SSH)")
     script = r"""
 BASE=http://localhost:8000
 PASS=0
@@ -444,24 +515,18 @@ check "DELETE /entries" 200 $STATUS
 echo "Results: $PASS passed, $FAIL_COUNT failed"
 [ $FAIL_COUNT -eq 0 ] && exit 0 || exit 1
 """
-    try:
-        result = run_out([
-            "az", "vm", "run-command", "invoke",
-            "--resource-group", rg, "--name", vm_name,
-            "--command-id", "RunShellScript",
-            "--scripts", script,
-            "--query", "value[0].message", "-o", "tsv"
-        ])
-        for line in result.split("\n"):
-            line = line.strip()
-            if line.startswith("PASS:"):
-                ok(line[5:].strip())
-            elif line.startswith("FAIL:"):
-                fail(line[5:].strip())
-            elif line.startswith("Results:"):
-                print(f"  {line}")
-    except subprocess.CalledProcessError as e:
-        fail(f"API tests could not run: {e}")
+    rc, out, err = ssh_run_script(vm_ip, key_path, script, timeout=60)
+    if rc not in (0, 1):
+        fail(f"API tests could not run (ssh exit {rc}): {err.strip()}")
+        return
+    for line in out.split("\n"):
+        line = line.strip()
+        if line.startswith("PASS:"):
+            ok(line[5:].strip())
+        elif line.startswith("FAIL:"):
+            fail(line[5:].strip())
+        elif line.startswith("Results:"):
+            print(f"  {line}")
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
@@ -470,7 +535,6 @@ def parse_args():
     p.add_argument("--password", help="PostgreSQL admin password (skips interactive prompt)")
     p.add_argument("--prefix",   default="learningsteps", help="Resource name prefix (default: learningsteps)")
     p.add_argument("--location", default="westeurope",    help="Azure region (default: westeurope)")
-    p.add_argument("--email",    required=False, default=None, help="Email for Let's Encrypt certificate (prompted if not provided)")
     return p.parse_args()
 
 def main():
@@ -479,18 +543,27 @@ def main():
 
     check_prerequisites()
     public_key = ensure_ssh_key()
+    key_path = SCRIPT_DIR / ".learningsteps_key"
     collect_config(public_key, args)
     deploy()
     vm_ip, rg, db_fqdn, vm_name, app_url, domain = read_outputs()
     setup_aad_ssh(rg, vm_name)
     check_azure_resources(rg, db_fqdn)
-    if wait_for_service(rg, vm_name):
-        run_api_tests(rg, vm_name)
-    email = args.email or input("\n  Email for Let's Encrypt certificate: ").strip()
-    if run_nginx_setup(rg, vm_name, domain, email):
-        wait_for_nginx_tls(app_url)
+    if wait_for_service(vm_ip, key_path):
+        run_api_tests(vm_ip, key_path)
+
+    if run_npmplus_setup(vm_ip, key_path):
+        wait_for_npmplus(app_url)
+    run_oauth2_proxy_setup(vm_ip, key_path)
+    run_json_logging_setup(vm_ip, key_path)
 
     print()
+    print(_c("1;36", "  Baseline is up. The following are LIVE CLASSROOM DEMO steps, not automated:"))
+    print("    Day 2 — az ad app create, then fill /etc/oauth2-proxy/oauth2-proxy.env, enable the service,")
+    print("            create an NPMplus Proxy Host with Auth Request = oauth2proxy")
+    print("    Day 4 — create the Proxy Host with SSL off, curl plaintext, then toggle 'Request a new")
+    print("            SSL Certificate', then wire CrowdSec (cscli bouncers add + crowdsec.conf ENABLED=true)")
+    print("    See docs/course-updates/day2-handbook.md and day4-handbook.md for exact commands.")
     if not FAILURES:
         print(_c("0;32", "  All checks passed. Deployment is working."))
     else:

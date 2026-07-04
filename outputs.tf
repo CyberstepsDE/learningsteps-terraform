@@ -9,8 +9,13 @@ output "domain_name" {
 }
 
 output "app_url" {
-  description = "HTTPS URL for the LearningSteps API (Nginx + Let's Encrypt)"
+  description = "HTTPS URL for the LearningSteps API (NPMplus Proxy Host + Let's Encrypt — created live in the Day 4 demo)"
   value       = azurerm_public_ip.vm.fqdn != null ? "https://${azurerm_public_ip.vm.fqdn}" : null
+}
+
+output "npmplus_admin_tunnel_command" {
+  description = "NPMplus admin GUI (port 81) is intentionally NOT exposed via NSG — same lockdown principle as Day 1 SSH. Use an SSH tunnel."
+  value       = "ssh -i ${"~/.learningsteps_key"} -L 8081:localhost:81 ${var.vm_admin_username}@${azurerm_public_ip.vm.ip_address}   # then browse https://localhost:8081"
 }
 
 output "postgresql_fqdn" {

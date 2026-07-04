@@ -81,11 +81,21 @@ resource "azurerm_sentinel_alert_rule_scheduled" "waf_attack" {
   trigger_operator           = "GreaterThan"
   trigger_threshold          = 0
 
+  # NOTE on this query's shape (found + fixed during the NPMplus migration):
+  # the old hand-rolled nginx setup wrote raw syslog lines shaped like
+  # "nginx: {json}", so ProcessName wasn't reliably parsed by AMA and the
+  # query pulled the JSON out of SyslogMessage with a regex. The NPMplus
+  # log-forwarder (scripts/setup-json-logging.sh) uses `logger -t nginx`,
+  # which AMA/rsyslog parses into a clean ProcessName="nginx" column, with
+  # SyslogMessage containing ONLY the JSON body (no "nginx: " prefix) —
+  # confirmed via direct Log Analytics queries against a live test
+  # deployment. The old regex-based extract() never matched this shape and
+  # silently returned zero rows. This version reads ProcessName directly and
+  # parses SyslogMessage as JSON with no regex.
   query = <<-KQL
     Syslog
-    | where Facility == "local0"
-    | where SyslogMessage contains "nginx"
-    | extend log = parse_json(extract(@'nginx: (\{.*\})', 1, SyslogMessage))
+    | where ProcessName == "nginx"
+    | extend log = parse_json(SyslogMessage)
     | extend StatusCode = toint(log.status)
     | extend ClientIP   = tostring(log.remote_addr)
     | extend Uri        = tostring(log.uri)

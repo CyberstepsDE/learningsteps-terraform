@@ -17,9 +17,17 @@ resource "azurerm_network_security_group" "app" {
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
 
+  # Priorities 100-199 are reserved for Sentinel's auto-block playbook
+  # (templates/block-ip-playbook.json creates "sentinel-block-<ip>" deny
+  # rules at priority 100). Found by testing: with the allow-* rules
+  # originally at 100/110/120 and the deny rule at 200, the lower-numbered
+  # (higher-precedence) allow-* rules always won and the auto-block was
+  # silently a no-op — confirmed live (SSH and the app both remained
+  # reachable from a "blocked" IP). Baseline allow rules now start at 1000
+  # so the auto-block deny rule always evaluates first.
   security_rule {
     name                       = "allow-ssh"
-    priority                   = 100
+    priority                   = 1000
     direction                  = "Inbound"
     access                     = "Allow"
     protocol                   = "Tcp"
@@ -31,7 +39,7 @@ resource "azurerm_network_security_group" "app" {
 
   security_rule {
     name                       = "allow-http"
-    priority                   = 110
+    priority                   = 1010
     direction                  = "Inbound"
     access                     = "Allow"
     protocol                   = "Tcp"
@@ -43,7 +51,7 @@ resource "azurerm_network_security_group" "app" {
 
   security_rule {
     name                       = "allow-https"
-    priority                   = 120
+    priority                   = 1020
     direction                  = "Inbound"
     access                     = "Allow"
     protocol                   = "Tcp"

@@ -113,7 +113,7 @@
                     },
                     "body": {
                       "properties": {
-                        "priority": 200,
+                        "priority": 100,
                         "protocol": "*",
                         "access": "Deny",
                         "direction": "Inbound",
