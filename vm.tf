@@ -51,9 +51,31 @@ resource "azurerm_linux_virtual_machine" "vm" {
     version   = "latest"
   }
 
+  # Built from static values (server name is deterministic:
+  # "psql-${var.prefix}.postgres.database.azure.com", matching
+  # postgresql.tf's `name = "psql-${var.prefix}"`) rather than referencing
+  # azurerm_postgresql_flexible_server.main.fqdn directly. Found by testing
+  # (Day 3's practice DB recreate, `terraform apply -replace=...postgresql_flexible_server.main`):
+  # referencing the live resource's computed .fqdn attribute here means ANY
+  # replacement of the PostgreSQL server — including the exact "destroy and
+  # recreate" operation Day 3 has students practice — makes custom_data
+  # "known after apply" and forces the VM itself to be destroyed and
+  # recreated too, wiping every bit of Day 1/2/4/5's manually-configured
+  # state (NPMplus, oauth2-proxy, CrowdSec — none of which are reprovisioned
+  # by cloud-init, only by deploy.py's one-time SSH setup scripts). Confirmed
+  # live: after a DB-only `-replace`, the VM's SSH host key changed and
+  # Docker/NPMplus/oauth2-proxy were gone entirely. Using a statically
+  # derivable FQDN removes the dependency edge, so replacing the database
+  # server no longer forces a VM replacement.
   custom_data = base64encode(templatefile("${path.module}/scripts/cloud-init.yaml", {
-    database_url = "postgresql://${var.db_admin_username}:${var.db_admin_password}@${azurerm_postgresql_flexible_server.main.fqdn}/${var.db_name}?sslmode=require"
+    database_url = "postgresql://${var.db_admin_username}:${var.db_admin_password}@psql-${var.prefix}.postgres.database.azure.com/${var.db_name}?sslmode=require"
   }))
+
+  # Explicit ordering only (cloud-init's runcmd already retries the DB
+  # connection until it succeeds) — keeps "DB should exist before the VM
+  # tries to use it" predictable without coupling custom_data to a
+  # computed attribute.
+  depends_on = [azurerm_postgresql_flexible_server.main]
 }
 
 resource "azurerm_virtual_machine_extension" "aad_ssh" {

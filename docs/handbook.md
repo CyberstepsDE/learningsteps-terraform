@@ -33,9 +33,14 @@ IP entirely.
 ### Demo
 
 1. Confirm you have the **Virtual Machine Administrator Login** role on the
-   VM:
+   VM. This role is assigned scoped to the VM resource (not the
+   subscription), so `az role assignment list` needs an explicit `--scope`
+   pointing at the VM — without it, the command silently returns an empty
+   list even when the role is correctly assigned:
    ```
-   az role assignment list --assignee <your-email> --role "Virtual Machine Administrator Login"
+   VM_ID=$(az vm show --resource-group <rg> --name <vm-name> --query id -o tsv)
+   az role assignment list --assignee <your-email> \
+     --role "Virtual Machine Administrator Login" --scope "$VM_ID"
    ```
 2. Log in with Entra ID — no key file involved:
    ```
@@ -104,9 +109,32 @@ to the application layer instead of SSH.
        --sign-in-audience AzureADMyOrg \
        --query appId -o tsv)
    az ad app update --id $APP_ID --identifier-uris api://$APP_ID
+   az ad sp create --id $APP_ID
    SECRET=$(az ad app credential reset --id $APP_ID --query password -o tsv)
    TENANT_ID=$(az account show --query tenantId -o tsv)
    ```
+   `az ad app create` only creates the Application object — it does **not**
+   create a Service Principal, and without one the app can't act as a
+   sign-in/token audience in this tenant at all (confirmed by testing:
+   `az ad sp show --id $APP_ID` 404s until you run `az ad sp create`).
+
+   Also required — force v2.0-format access tokens for this app:
+   ```
+   OBJECT_ID=$(az ad app show --id $APP_ID --query id -o tsv)
+   az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$OBJECT_ID" \
+     --body '{"api":{"requestedAccessTokenVersion":2}}'
+   ```
+   Without this, `az account get-access-token --resource api://$APP_ID`
+   (used in step 6 below) issues a **v1.0-format** token
+   (`"iss": "https://sts.windows.net/<tenant>/"`, `"ver": "1.0"`) by
+   default. oauth2-proxy is configured with the v2.0 issuer URL
+   (`https://login.microsoftonline.com/<tenant>/v2.0`) and will reject a
+   v1.0 token outright — confirmed by testing: `journalctl -u oauth2-proxy`
+   shows `oidc: id token issued by a different provider, expected
+   ".../v2.0" got "https://sts.windows.net/.../"`. This is unrelated to
+   `OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES` or `SKIP_JWT_BEARER_TOKENS` — both
+   can be configured correctly and the bearer-token test in step 6 will
+   still fail without this token-version fix.
 
 4. On the VM, configure oauth2-proxy (`/etc/oauth2-proxy/oauth2-proxy.env`):
    ```
@@ -128,14 +156,16 @@ to the application layer instead of SSH.
    config — worth opening the generated nginx config on the VM afterward to
    see what the dropdown just built for you.
 
-   Via API instead:
+   Via API instead — the field is `npmplus_auth_request` on the proxy host
+   object (confirmed via `GET /api/schema`; it accepts `"none"`,
+   `"oauth2proxy"`, and a handful of other supported auth backends), and the
+   upstream it points at is already fixed by `AUTH_REQUEST_OAUTH2PROXY_UPSTREAM`
+   (set on the NPMplus container by `setup-npmplus.sh`) — so a single PUT is
+   enough, no `advanced_config`/`access_list_id` fields needed:
    ```bash
    curl -sk -X PUT https://localhost:8081/api/nginx/proxy-hosts/<id> \
      -b npm.cookies -H "Content-Type: application/json" \
-     -d '{"advanced_config":"","locations":[],"access_list_id":0}'
-   # Then set AUTH_REQUEST_OAUTH2PROXY_UPSTREAM=http://127.0.0.1:4180 as an
-   # env var on the NPMplus container and select the provider on the host
-   # via the API's auth-request field per /api/schema for your NPMplus version.
+     -d '{"npmplus_auth_request":"oauth2proxy"}'
    ```
 
 6. Test:
@@ -155,6 +185,14 @@ to the application layer instead of SSH.
      ```
      This should return `200` with no browser redirect — oauth2-proxy
      validates the bearer token directly against Entra ID's signing keys.
+     The **first** time you run this `az account get-access-token` command
+     for this resource, Azure CLI may open a browser for a one-time
+     consent prompt ("learningsteps-oauth2-proxy wants access to your
+     data") — this is normal incremental consent for a new
+     app+resource+user combination, not an error; approve it once and
+     subsequent calls are silent. (This is separate from — and does not
+     replace — the `api.requestedAccessTokenVersion` fix in step 3, which
+     is required regardless of consent.)
 
 ### Troubleshooting
 
@@ -168,29 +206,72 @@ to the application layer instead of SSH.
 
 ## Day 3 — Data Isolation
 
-**Goal**: move the database off the public internet entirely, using Azure's
-Private Link, and practice a safe migration.
+**Goal**: understand why the database has no public IP at all (Azure Private
+Link — reachable only from inside the virtual network), and practice a safe,
+backup-first migration by recreating it.
 
-A publicly reachable database is a standing target. Today the database moves
-into a private subnet with no public IP at all — reachable only from inside
-the virtual network. Since this requires recreating the database server, you
-also practice a proper backup-first migration.
+**Note on this baseline**: unlike Day 2 and Day 4 (where the software is
+pre-installed but left *unwired* for the live demo), `postgresql.tf` already
+deploys the database fully private — delegated subnet, private DNS zone,
+`public_network_access_enabled = false` — from the very first
+`python3 deploy.py` run at the start of the week. There is no earlier
+"public database" phase to migrate away from; `terraform apply` against an
+unmodified `postgresql.tf` at this point in the course is a no-op (confirmed
+by testing — `terraform plan` shows zero pending changes to any DB
+resource). The goal of this exercise is thus **why** the database is
+architected this way, and giving you a real, disruptive
+backup-then-recreate to practice on — not walking a live public→private
+transition that doesn't exist in this repo's baseline.
 
 ### Demo
 
-1. Back up the current database from the VM (acting as your access point):
+1. Back up the current database **via the VM** (the DB has no public IP, so
+   the dump has to run over SSH, not directly from your laptop) and pull the
+   result down to your own machine — don't leave your only copy on the VM:
    ```
-   pg_dump "postgresql://psqladmin@<db-fqdn>/learning_journal?sslmode=require" \
+   ssh -i .learningsteps_key azureuser@<vm-ip> \
+     'pg_dump "postgresql://psqladmin@<db-fqdn>/learning_journal?sslmode=require"' \
      > learningsteps_backup.sql
    ```
    Confirm the file is non-empty and contains real table data before
-   proceeding — there's no undo once the next step runs.
+   proceeding — there's no undo once the next step runs. Pulling it to your
+   laptop (rather than leaving it in `/tmp` on the VM) matters here: a bad
+   Day 3 practice run can end up recreating more than just the database (see
+   the callout below), so treat the VM as disposable too.
 
-2. `terraform apply` with the updated `postgresql.tf` — this destroys the
-   public database and recreates it inside a delegated subnet, resolvable
-   only via a private DNS zone.
+   **Prerequisite (found by testing):** the VM's default `postgresql-client`
+   package (Ubuntu 22.04) is v14, but the server runs PostgreSQL 16 —
+   `pg_dump` refuses to dump a *newer* major server version
+   ("aborting because of server version mismatch"). `scripts/cloud-init.yaml`
+   now installs `postgresql-client-16` from the PGDG apt repo instead of the
+   distro default, so this is only relevant if you're on an older VM image;
+   confirm with `pg_dump --version` before proceeding if in doubt.
 
-3. Restore from the VM (the only machine that can now reach the database):
+2. Force a destroy-and-recreate of the database server, to practice the
+   backup-first discipline on a real (not hypothetical) operation:
+   ```
+   terraform apply -replace="azurerm_postgresql_flexible_server.main"
+   ```
+   This destroys and recreates the same (already-private) server —
+   confirmed by testing to take several minutes, during which the app on
+   the VM cannot reach the database at all.
+
+   **A serious bug this uncovered, now fixed:** `vm.tf`'s `custom_data`
+   used to interpolate `azurerm_postgresql_flexible_server.main.fqdn`
+   directly. Replacing the database resource made that value "known after
+   apply," which — because any `custom_data` change forces VM replacement —
+   cascaded into destroying and recreating **the entire VM** too. Confirmed
+   live: after one `-replace` of just the database, the VM's SSH host key
+   had changed and Docker/NPMplus/CrowdSec/oauth2-proxy were gone
+   completely (none of that is reprovisioned by cloud-init — only by
+   `deploy.py`'s one-time SSH setup scripts). `vm.tf` now builds the
+   connection string from the statically-known server name
+   (`psql-${var.prefix}.postgres.database.azure.com`) instead of the live
+   resource attribute, which removes the dependency edge — confirmed by
+   re-running the same `-replace` after the fix: `terraform plan` showed
+   zero changes to `custom_data` and the VM was untouched.
+
+3. Restore from the VM (the only machine that can reach the database):
    ```
    scp -i .learningsteps_key learningsteps_backup.sql azureuser@<vm-ip>:/tmp/
    ssh -i .learningsteps_key azureuser@<vm-ip> \
@@ -199,7 +280,21 @@ also practice a proper backup-first migration.
 
 4. Verify the lockdown: a connection attempt from your laptop should fail to
    resolve the database's hostname at all, while the app (running on the VM,
-   inside the same virtual network) keeps working normally.
+   inside the same virtual network) keeps working normally once restored.
+
+5. **Check what needs restarting afterward.** The recreated server gets a
+   new private IP (same hostname/FQDN, since the server name is fixed by
+   `prefix`, but the VM's local DNS/connection-pool state can go stale) —
+   confirm the app on the VM is actually serving data again, not just that
+   the server exists:
+   ```
+   curl -s https://<domain>/entries -H "Authorization: Bearer $TOKEN"
+   ```
+   If this still fails after the restore, restart the API service to force
+   a fresh DNS resolution and connection:
+   ```
+   ssh -i .learningsteps_key azureuser@<vm-ip> "sudo systemctl restart learningsteps"
+   ```
 
 ### Troubleshooting
 
@@ -207,6 +302,9 @@ also practice a proper backup-first migration.
   this is expected. Your laptop is outside the virtual network and has no
   route to the private address space; only resources inside the VNet (like
   the VM) can reach it.
+- **`terraform apply` (with no `-replace`) reports no changes** — this is
+  expected in this baseline; see the note above. Use `-replace` to force
+  the practice recreate.
 
 ---
 
