@@ -35,6 +35,10 @@ resource "azurerm_linux_virtual_machine" "vm" {
     public_key = var.vm_admin_ssh_key
   }
 
+  identity {
+    type = "SystemAssigned"
+  }
+
   os_disk {
     caching              = "ReadWrite"
     storage_account_type = "Standard_LRS"
@@ -50,4 +54,13 @@ resource "azurerm_linux_virtual_machine" "vm" {
   custom_data = base64encode(templatefile("${path.module}/scripts/cloud-init.yaml", {
     database_url = "postgresql://${var.db_admin_username}:${var.db_admin_password}@${azurerm_postgresql_flexible_server.main.fqdn}/${var.db_name}?sslmode=require"
   }))
+}
+
+resource "azurerm_virtual_machine_extension" "aad_ssh" {
+  name                       = "AADSSHLoginForLinux"
+  virtual_machine_id         = azurerm_linux_virtual_machine.vm.id
+  publisher                  = "Microsoft.Azure.ActiveDirectory"
+  type                       = "AADSSHLoginForLinux"
+  type_handler_version       = "1.0"
+  auto_upgrade_minor_version = true
 }

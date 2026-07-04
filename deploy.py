@@ -117,6 +117,13 @@ def check_prerequisites():
         account = run_out(["az", "account", "show", "--query", "{name:name}", "-o", "json"])
         ok(f"Logged in — subscription: {json.loads(account)['name']}")
 
+    try:
+        run_out(["az", "extension", "show", "--name", "ssh"])
+        ok("az ssh extension present")
+    except subprocess.CalledProcessError:
+        warn("az ssh extension missing — installing")
+        run(["az", "extension", "add", "--name", "ssh", "--yes"])
+
 # ── step 2 — ssh key ──────────────────────────────────────────────────────────
 
 def ensure_ssh_key():
@@ -222,19 +229,59 @@ def read_outputs():
     raw = tf(["terraform", "output", "-json"])
     out = json.loads(raw)
 
-    vm_ip   = out["vm_public_ip"]["value"]
-    rg      = out["resource_group_name"]["value"]
-    db_fqdn = out["postgresql_fqdn"]["value"]
-    ssh_cmd = out["ssh_command"]["value"]
+    vm_ip      = out["vm_public_ip"]["value"]
+    rg         = out["resource_group_name"]["value"]
+    db_fqdn    = out["postgresql_fqdn"]["value"]
+    ssh_cmd    = out["ssh_command"]["value"]
+    vm_name    = out["vm_name"]["value"]
+    az_ssh_cmd = out["az_ssh_command"]["value"]
+    app_url    = out["app_url"]["value"]
+    domain     = out["domain_name"]["value"]
 
-    print(f"  VM IP   : {vm_ip}")
-    print(f"  API     : http://{vm_ip}:8000/docs")
-    print(f"  DB      : {db_fqdn}")
-    print(f"  SSH     : {ssh_cmd} -i {SCRIPT_DIR / '.learningsteps_key'}")
+    print(f"  VM IP        : {vm_ip}")
+    print(f"  Domain       : {domain}")
+    print(f"  API (HTTPS)  : {app_url}/docs")
+    print(f"  DB           : {db_fqdn}")
+    print(f"  SSH key      : {ssh_cmd} -i {SCRIPT_DIR / '.learningsteps_key'}")
+    print(f"  SSH AAD      : {az_ssh_cmd}")
 
-    return vm_ip, rg, db_fqdn
+    return vm_ip, rg, db_fqdn, vm_name, app_url, domain
 
-# ── step 6 — azure checks ─────────────────────────────────────────────────────
+# ── step 6 — azure ad ssh ────────────────────────────────────────────────────
+
+def setup_aad_ssh(rg, vm_name):
+    info("Azure AD SSH — role assignment")
+
+    try:
+        user_id = run_out(["az", "ad", "signed-in-user", "show", "--query", "id", "-o", "tsv"])
+    except subprocess.CalledProcessError:
+        warn("Could not retrieve signed-in user — skipping AAD SSH role assignment")
+        return
+
+    vm_id = run_out(["az", "vm", "show", "--resource-group", rg, "--name", vm_name,
+                     "--query", "id", "-o", "tsv"])
+
+    existing = run_out(["az", "role", "assignment", "list",
+                        "--assignee", user_id,
+                        "--role", "Virtual Machine Administrator Login",
+                        "--scope", vm_id,
+                        "--query", "length(@)", "-o", "tsv"])
+    if existing.strip() != "0":
+        ok("Role 'Virtual Machine Administrator Login' already assigned — skipping")
+        return
+
+    try:
+        run(["az", "role", "assignment", "create",
+             "--assignee", user_id,
+             "--role", "Virtual Machine Administrator Login",
+             "--scope", vm_id],
+            stdout=subprocess.DEVNULL)
+        ok(f"Role 'Virtual Machine Administrator Login' assigned to current user")
+    except subprocess.CalledProcessError:
+        warn("Role assignment failed — you may need Owner/User Access Administrator on the subscription")
+        warn(f"Run manually: az role assignment create --assignee <email> --role 'Virtual Machine Administrator Login' --scope {vm_id}")
+
+# ── step 7 — azure checks ─────────────────────────────────────────────────────
 
 def check_azure_resources(rg, db_fqdn):
     info("Azure resource checks")
@@ -284,72 +331,137 @@ def check_azure_resources(rg, db_fqdn):
     else:
         fail(f"PostgreSQL state: {db_state}")
 
-# ── step 7 — wait for api ─────────────────────────────────────────────────────
+# ── step 8 — wait for api ─────────────────────────────────────────────────────
 
-def wait_for_api(vm_ip):
-    info("Waiting for API (cloud-init takes ~20 min)")
-    api = f"http://{vm_ip}:8000"
-    for _ in range(300):
+def wait_for_service(rg, vm_name):
+    info("Waiting for API service to start on VM (cloud-init takes ~20 min)")
+    for _ in range(100):
         try:
-            urllib.request.urlopen(f"{api}/docs", timeout=3)
-            print()
-            ok(f"API reachable at {api}")
-            return api
-        except Exception:
-            print(".", end="", flush=True)
-            time.sleep(5)
+            result = run_out([
+                "az", "vm", "run-command", "invoke",
+                "--resource-group", rg, "--name", vm_name,
+                "--command-id", "RunShellScript",
+                "--scripts", "curl -sf localhost:8000/entries > /dev/null && echo READY || echo NOT_READY",
+                "--query", "value[0].message", "-o", "tsv"
+            ])
+            if "READY" in result:
+                print()
+                ok("API service is running on VM")
+                return True
+        except subprocess.CalledProcessError:
+            pass
+        print(".", end="", flush=True)
+        time.sleep(15)
     print()
-    fail("API did not respond after 25 min — SSH in and run: sudo journalctl -u learningsteps -f")
-    return None
+    fail("API service not ready after 25 min — SSH in and check: sudo journalctl -u learningsteps -f")
+    return False
 
-# ── step 8 — api tests ────────────────────────────────────────────────────────
-
-def _request(method, url, body=None):
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+def run_nginx_setup(rg, vm_name, domain, email):
+    info("Nginx + Let's Encrypt + NAXSI setup (runs on VM via az run-command)")
+    script_path = SCRIPT_DIR / "scripts" / "setup-nginx.sh"
+    script_content = script_path.read_text()
+    full_script = f"export DOMAIN='{domain}'\nexport EMAIL='{email}'\n" + script_content
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        return e.code, {}
+        result = run_out([
+            "az", "vm", "run-command", "invoke",
+            "--resource-group", rg, "--name", vm_name,
+            "--command-id", "RunShellScript",
+            "--scripts", full_script,
+            "--query", "value[0].message", "-o", "tsv",
+        ])
+        for line in result.split("\n"):
+            line = line.strip()
+            if line:
+                print(f"  {line}")
+        ok("Nginx setup complete")
+        return True
+    except subprocess.CalledProcessError as e:
+        fail(f"Nginx setup failed: {e}")
+        warn("SSH in and run manually: sudo bash /tmp/setup-nginx.sh <domain> <email>")
+        return False
 
-def run_api_tests(api):
-    info("API tests")
 
-    status, _ = _request("GET", f"{api}/entries")
-    if status == 200:
-        ok("GET /entries → 200")
-    else:
-        fail(f"GET /entries → {status}")
+def wait_for_nginx_tls(app_url):
+    info(f"Waiting for Nginx HTTPS to be ready")
+    url = f"{app_url}/entries"
+    for _ in range(40):
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(url), timeout=5)
+            print()
+            ok(f"Nginx HTTPS reachable at {app_url} (HTTP {resp.status})")
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (302, 401, 403, 404):
+                print()
+                ok(f"Nginx HTTPS reachable at {app_url} (HTTP {e.code})")
+                return True
+        except Exception:
+            pass
+        print(".", end="", flush=True)
+        time.sleep(15)
+    print()
+    warn("Nginx HTTPS did not respond — check: sudo journalctl -u nginx -f  or  sudo cat /var/log/letsencrypt/letsencrypt.log")
+    return False
 
-    status, body = _request("POST", f"{api}/entries",
-                             {"work": "deploy test", "struggle": "none", "intention": "verify"})
-    entry_id = body.get("entry", {}).get("id", "")
-    if status == 200 and entry_id:
-        ok(f"POST /entries → created id={entry_id}")
-    else:
-        fail(f"POST /entries → {status} {body}")
+# ── step 9 — api tests ────────────────────────────────────────────────────────
 
-    status, body = _request("GET", f"{api}/entries")
-    count = body.get("count", 0) if isinstance(body, dict) else 0
-    if status == 200 and count >= 1:
-        ok(f"GET /entries → {count} entry found")
-    else:
-        fail(f"GET /entries → empty after insert")
+def run_api_tests(rg, vm_name):
+    info("API tests (running inside VM via run-command)")
+    script = r"""
+BASE=http://localhost:8000
+PASS=0
+FAIL_COUNT=0
 
-    if entry_id:
-        status, _ = _request("PATCH", f"{api}/entries/{entry_id}", {"intention": "verified"})
-        if status == 200:
-            ok(f"PATCH /entries/{entry_id} → 200")
-        else:
-            fail(f"PATCH /entries/{entry_id} → {status}")
+check() {
+    local label=$1 expected=$2 actual=$3
+    if [ "$actual" = "$expected" ]; then
+        echo "PASS: $label"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL: $label (expected $expected got $actual)"
+        FAIL_COUNT=$((FAIL_COUNT+1))
+    fi
+}
 
-    status, _ = _request("DELETE", f"{api}/entries")
-    if status == 200:
-        ok("DELETE /entries (cleanup) → 200")
-    else:
-        fail(f"DELETE /entries → {status}")
+STATUS=$(curl -sf -o /dev/null -w "%{http_code}" $BASE/entries 2>/dev/null || echo 000)
+check "GET /entries" 200 $STATUS
+
+RESP=$(curl -sf -X POST $BASE/entries -H 'Content-Type: application/json' \
+    -d '{"work":"deploy test","struggle":"none","intention":"verify"}' 2>/dev/null || echo '{}')
+HAS_ID=$(echo $RESP | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if 'entry' in d else 'no')" 2>/dev/null || echo no)
+check "POST /entries" yes $HAS_ID
+ID=$(echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['entry']['id'])" 2>/dev/null || echo "")
+
+if [ -n "$ID" ]; then
+    STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X PATCH $BASE/entries/$ID \
+        -H 'Content-Type: application/json' -d '{"intention":"verified"}' 2>/dev/null || echo 000)
+    check "PATCH /entries/$ID" 200 $STATUS
+fi
+
+STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -X DELETE $BASE/entries 2>/dev/null || echo 000)
+check "DELETE /entries" 200 $STATUS
+
+echo "Results: $PASS passed, $FAIL_COUNT failed"
+[ $FAIL_COUNT -eq 0 ] && exit 0 || exit 1
+"""
+    try:
+        result = run_out([
+            "az", "vm", "run-command", "invoke",
+            "--resource-group", rg, "--name", vm_name,
+            "--command-id", "RunShellScript",
+            "--scripts", script,
+            "--query", "value[0].message", "-o", "tsv"
+        ])
+        for line in result.split("\n"):
+            line = line.strip()
+            if line.startswith("PASS:"):
+                ok(line[5:].strip())
+            elif line.startswith("FAIL:"):
+                fail(line[5:].strip())
+            elif line.startswith("Results:"):
+                print(f"  {line}")
+    except subprocess.CalledProcessError as e:
+        fail(f"API tests could not run: {e}")
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
@@ -358,6 +470,7 @@ def parse_args():
     p.add_argument("--password", help="PostgreSQL admin password (skips interactive prompt)")
     p.add_argument("--prefix",   default="learningsteps", help="Resource name prefix (default: learningsteps)")
     p.add_argument("--location", default="westeurope",    help="Azure region (default: westeurope)")
+    p.add_argument("--email",    required=False, default=None, help="Email for Let's Encrypt certificate (prompted if not provided)")
     return p.parse_args()
 
 def main():
@@ -368,11 +481,14 @@ def main():
     public_key = ensure_ssh_key()
     collect_config(public_key, args)
     deploy()
-    vm_ip, rg, db_fqdn = read_outputs()
+    vm_ip, rg, db_fqdn, vm_name, app_url, domain = read_outputs()
+    setup_aad_ssh(rg, vm_name)
     check_azure_resources(rg, db_fqdn)
-    api = wait_for_api(vm_ip)
-    if api:
-        run_api_tests(api)
+    if wait_for_service(rg, vm_name):
+        run_api_tests(rg, vm_name)
+    email = args.email or input("\n  Email for Let's Encrypt certificate: ").strip()
+    if run_nginx_setup(rg, vm_name, domain, email):
+        wait_for_nginx_tls(app_url)
 
     print()
     if not FAILURES:

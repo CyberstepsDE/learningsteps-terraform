@@ -28,8 +28,8 @@ write_files:
 runcmd:
   - git clone https://github.com/CyberstepsDE/learningsteps.git /opt/learningsteps
   - python3 -m venv /opt/learningsteps/venv
-  - /opt/learningsteps/venv/bin/pip install --upgrade pip
-  - /opt/learningsteps/venv/bin/pip install -r /opt/learningsteps/api/requirements.txt
+  - /opt/learningsteps/venv/bin/pip install --upgrade pip -q
+  - /opt/learningsteps/venv/bin/pip install -r /opt/learningsteps/api/requirements.txt -q
   - until psql "${database_url}" -c '\q' 2>/dev/null; do sleep 5; done
   - psql "${database_url}" -f /opt/learningsteps/database_setup.sql
   - systemctl daemon-reload

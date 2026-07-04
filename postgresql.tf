@@ -1,11 +1,5 @@
-resource "random_string" "db_suffix" {
-  length  = 6
-  upper   = false
-  special = false
-}
-
 resource "azurerm_postgresql_flexible_server" "main" {
-  name                   = "psql-${var.prefix}-${random_string.db_suffix.result}"
+  name                   = "psql-${var.prefix}"
   location               = azurerm_resource_group.main.location
   resource_group_name    = azurerm_resource_group.main.name
   version                = "16"
@@ -15,7 +9,11 @@ resource "azurerm_postgresql_flexible_server" "main" {
   storage_mb             = 32768
   zone                   = "1"
 
-  public_network_access_enabled = true
+  public_network_access_enabled = false
+  delegated_subnet_id           = azurerm_subnet.db.id
+  private_dns_zone_id           = azurerm_private_dns_zone.postgres.id
+
+  depends_on = [azurerm_private_dns_zone_virtual_network_link.postgres]
 }
 
 resource "azurerm_postgresql_flexible_server_database" "app" {
@@ -23,11 +21,4 @@ resource "azurerm_postgresql_flexible_server_database" "app" {
   server_id = azurerm_postgresql_flexible_server.main.id
   charset   = "UTF8"
   collation = "en_US.utf8"
-}
-
-resource "azurerm_postgresql_flexible_server_firewall_rule" "allow_all" {
-  name             = "allow-all"
-  server_id        = azurerm_postgresql_flexible_server.main.id
-  start_ip_address = "0.0.0.0"
-  end_ip_address   = "255.255.255.255"
 }

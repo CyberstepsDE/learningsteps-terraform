@@ -10,3 +10,6 @@ __pycache__/
 .claude/
 SECURITY_ROADMAP.md
 .terraform.tfstate.lock.info
+terraform.tfstate.*.backup
+.DS_Store
+*.sql
