@@ -296,8 +296,7 @@ ordering, covered explicitly in Day 3.
   make more admin API calls through the tunnel, not just the first time.
   `sudo docker exec crowdsec cscli decisions list` may not show it (this ban
   can live in the bouncer's local cache rather than CrowdSec's own decision
-  store) — the reliable fix, confirmed by testing, is to disable and
-  restart:
+  store) — the reliable fix is to disable and restart:
   ```
   sudo sed -i 's/^ENABLED=.*/ENABLED=false/' /opt/npmplus/crowdsec/crowdsec.conf
   cd /opt/npmplus && sudo docker compose restart npmplus
@@ -483,9 +482,9 @@ curl -sk -X PUT https://localhost:8081/api/nginx/proxy-hosts/<id> \
 - `curl -i -H "Authorization: Bearer garbage" https://<domain>/` → also
   redirected (a malformed token doesn't get a free pass).
 - Visit `https://<domain>/` in a browser, complete the Microsoft login, land
-  on the app with a valid session — **confirmed working end-to-end by live
-  test**. This is the real proof the identity gate works; it only works now
-  because TLS (Day 2) makes the HTTPS reply URL possible.
+  on the app with a valid session. This is the real end-to-end proof the
+  identity gate works; it only works now because TLS (Day 2) makes the
+  HTTPS reply URL possible.
 
 Keep that same browser tab open — the rest of the authenticated checks in
 this project (Day 3 Demo 5, Day 4, Day 5) just mean visiting a URL directly
@@ -528,16 +527,14 @@ covers, not just adding coverage on top.
 
 ## Day 4 — Data Isolation
 
-**Goal**: migrate the database off the public internet onto Azure Private
-Link — reachable only from inside the virtual network — and practice a
+**Goal**: migrate the database off the public internet onto Azure VNet
+Integration — reachable only from inside the virtual network — and practice a
 real, backup-first migration while doing it.
 
-**Baseline for today**: the database is genuinely public right now —
+**Baseline for today**: the database is public right now —
 `postgresql.tf` deploys it with a wide-open firewall rule
 (`azurerm_postgresql_flexible_server_firewall_rule.allow_all`, `0.0.0.0` -
-`255.255.255.255`) from the very first `python3 deploy.py` run. This is the
-one deliberately-insecure piece left in the baseline all week, specifically
-so today's migration is real rather than theoretical.
+`255.255.255.255`) from the very first `python3 deploy.py` run.
 
 ### Demo 1 — Confirm the Database Is Public
 
@@ -564,9 +561,8 @@ backup isn't just an empty schema).
 
 **Prerequisite**: your local `psql`/`pg_dump` needs to be version 16 or
 newer to match the server — an older client refuses to dump a *newer*
-major server version ("aborting because of server version mismatch"),
-confirmed live (macOS ships `pg_dump` 14 by default). Install/upgrade if
-needed:
+major server version ("aborting because of server version mismatch") —
+macOS ships `pg_dump` 14 by default. Install/upgrade if needed:
 - **macOS**: `brew install postgresql@16` — this is keg-only and won't be
   on your `PATH` automatically; either
   `export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"` for this
@@ -576,7 +572,7 @@ needed:
 
 Confirm with `pg_dump --version` before proceeding if in doubt.
 
-### Demo 3 — Migrate to Private Link (Backup-First Practice)
+### Demo 3 — Migrate to VNet Integration (Backup-First Practice)
 
 This is the real, disruptive operation — do not run it until Demo 2's
 backup is confirmed non-empty on your own machine.
@@ -621,13 +617,9 @@ entirely, and add these lines inside `azurerm_postgresql_flexible_server.main`:
   depends_on = [azurerm_private_dns_zone_virtual_network_link.postgres]
 ```
 One more required edit — `vm.tf`'s `azurerm_linux_virtual_machine.vm`
-resource has its own `depends_on` that references the firewall rule you
-just deleted (it was there originally to fix a real race: a public
-Flexible Server denies all connections, including from the VM itself,
-until a firewall rule permits them — so the VM had to wait for it).
-Deleting the firewall rule without removing this reference makes
-`terraform apply` fail immediately with "reference to undeclared
-resource," confirmed live. Change:
+resource has a `depends_on` that references the firewall rule you just
+deleted. Leaving it in place makes `terraform apply` fail immediately with
+"reference to undeclared resource." Change:
 ```hcl
   depends_on = [
     azurerm_postgresql_flexible_server.main,
@@ -647,18 +639,16 @@ forces Terraform to destroy and recreate it — this isn't a flag you're
 toggling, it's a genuine migration. **Wait time: 5-8 minutes**, during
 which the app on the VM cannot reach the database at all.
 
-**A serious interaction to know about, already fixed in this repo**:
-`vm.tf`'s `custom_data` used to interpolate
-`azurerm_postgresql_flexible_server.main.fqdn` directly. Replacing the
-database resource made that value "known after apply," which — because any
-`custom_data` change forces VM replacement — cascaded into destroying and
-recreating **the entire VM** too, wiping Docker/NPMplus/CrowdSec/oauth2-proxy
-completely (none of that is reprovisioned by cloud-init — only by
-`deploy.py`'s one-time SSH setup scripts). `vm.tf` now builds the connection
+**A serious interaction to watch for**: if the VM's `custom_data` referenced
+the database's live `.fqdn` attribute directly, replacing the database
+would make that value "known after apply," which — because any
+`custom_data` change forces VM replacement — would cascade into destroying
+and recreating **the entire VM** too, wiping Docker/NPMplus/CrowdSec/
+oauth2-proxy completely (none of that is reprovisioned by cloud-init, only
+by `deploy.py`'s one-time SSH setup scripts). `vm.tf` builds the connection
 string from the statically-known server name
-(`psql-${var.prefix}.postgres.database.azure.com`) instead of the live
-resource attribute, removing that dependency — this migration leaves the
-VM untouched.
+(`psql-${var.prefix}.postgres.database.azure.com`) instead, so this
+migration leaves the VM untouched.
 
 ### Demo 4 — Restore and Verify Isolation
 
@@ -848,8 +838,8 @@ az network nsg rule delete --resource-group <rg> --nsg-name nsg-<prefix> --name 
   ones.
 - **Re-running the attack simulation (e.g. a second take, or a rehearsal
   run) doesn't create a new NSG block, and nothing looks wrong** —
-  confirmed live: Sentinel's default alert grouping merges a new alert from
-  the same rule into an existing **open** incident (status `New`/`Active`)
+  Sentinel's default alert grouping merges a new alert from the same rule
+  into an existing **open** incident (status `New`/`Active`)
   instead of creating a fresh one, if one from an earlier run is still open.
   The automation rule only triggers on incident *creation*, not on an
   existing incident being updated — so the playbook silently does not fire,
