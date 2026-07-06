@@ -138,9 +138,15 @@ def ssh_run_script(vm_ip, key_path, script_text, timeout=600):
     needed on either side). Returns (returncode, stdout, stderr)."""
     cmd = ["ssh", "-i", str(key_path), *SSH_OPTS, f"azureuser@{vm_ip}", "sudo bash -s"]
     cmd = _resolve_cmd(cmd)
+    # Send as bytes with LF-only line endings. With text=True, Python would
+    # translate every \n to os.linesep (\r\n on Windows) when writing to stdin,
+    # and the VM's bash would fail on the stray \r ($'\r': command not found).
+    payload = script_text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     try:
-        r = subprocess.run(cmd, input=script_text, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
+        r = subprocess.run(cmd, input=payload, capture_output=True, timeout=timeout)
+        return (r.returncode,
+                r.stdout.decode("utf-8", "replace"),
+                r.stderr.decode("utf-8", "replace"))
     except subprocess.TimeoutExpired:
         return 124, "", "ssh timed out"
     except FileNotFoundError as exc:
