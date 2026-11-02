@@ -20,11 +20,14 @@ resource "azurerm_network_interface" "vm" {
   }
 }
 
+# VM size: if Azure rejects it (SkuNotAvailable / capacity restriction), pick another
+# small size available in your region and subscription, e.g. Standard_D2s_v7.
+# Check with: az vm list-skus -l <region> --size Standard_D2 --output table
 resource "azurerm_linux_virtual_machine" "vm" {
   name                = "vm-${var.prefix}"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
-  size                = "Standard_D2s_v3"
+  size                = "Standard_D2s_v6"
   admin_username      = var.vm_admin_username
   network_interface_ids = [
     azurerm_network_interface.vm.id

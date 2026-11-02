@@ -8,7 +8,7 @@ For the walkthrough built on top of this deployment, see [handbook.md](handbook.
 
 ## What Gets Deployed
 
-- **Ubuntu VM** (Standard_D2s_v3) running the FastAPI application on port 8000
+- **Ubuntu VM** (Standard_D2s_v6) running the FastAPI application on port 8000
 - **Azure PostgreSQL Flexible Server** (B1ms) as the database
 - A virtual network with one subnet and a basic network security group
 
@@ -80,6 +80,16 @@ terraform destroy
 ```
 
 ## Troubleshooting
+
+- **VM creation fails with `SkuNotAvailable` or "not available for the
+  current subscription"** — Azure has no capacity for that VM size in your
+  region right now (this is on Azure's side, not a mistake in your setup).
+  Change `size` in `vm.tf` to another small size that is available, e.g.
+  `Standard_D2s_v7`, and run `terraform apply` again. List what your
+  subscription can use (sizes with no restriction listed are available):
+  ```bash
+  az vm list-skus -l westeurope --size Standard_D2 --output table
+  ```
 
 - **`terraform apply` fails with a Sentinel-related resource "already
   exists"** (seen on `azurerm_sentinel_log_analytics_workspace_onboarding.main`,
